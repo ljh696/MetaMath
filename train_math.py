@@ -17,7 +17,7 @@ import os
 import copy
 import logging
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Sequence
+from typing import Optional, Dict, Sequence, Union
 import io
 import torch
 import transformers
@@ -55,7 +55,12 @@ PROMPT_DICT = {
     "Write a response that appropriately completes the request.\n\n"
     "### Instruction:\n{instruction}\n\n### Response:"
     ),
+    "gsm8k":
+    """Problem: {input}\n
+    Solution:
+    """
 }
+#Instruction: Resolve the problem step by step below. \n
 #### 28
 @dataclass
 class ModelArguments:
@@ -64,7 +69,7 @@ class ModelArguments:
 
 @dataclass
 class DataArguments:
-    data_path: str = field(default=None, metadata={"help": "Path to the training data."})
+    data_path: str = field(default="", metadata={"help": "Path to the training data."})
 
 
 @dataclass
@@ -155,10 +160,11 @@ class SupervisedDataset(Dataset):
         super(SupervisedDataset, self).__init__()
         logging.warning("Loading data...")
         data_path = data_args.data_path
-        try:
-            data_path = data_path_map[data_path]
-        except:
-            data_path = data_path
+        # try:
+        #     data_path = data_path_map[data_path]
+        # except:
+        #     data_path = data_path
+        # 尝试直接解析
         try:
             list_data_dict = jload(data_path)
         except BaseException:
@@ -166,23 +172,35 @@ class SupervisedDataset(Dataset):
                 lines = f.readlines()
             list_data_dict = [json.loads(line.strip()) for line in lines]
 
+        # data_length指定数据集大小
         list_data_dict = random.sample(list_data_dict,  len(list_data_dict))
         list_data_dict = list_data_dict[:data_args.data_length]
 
         # logging.warning("Formatting inputs...")
-        prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
+        prompt_input = PROMPT_DICT["gsm8k"]
+        # prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
         # print(list_data_dict[0])
-        if 'instruction' in list_data_dict[0]:
-            pass
-        else:
-            def get_input(query):
-                if query.find('\n') == -1:
-                    return ''
-                return '\n'.join(query.split('\n')[1:])
-            list_data_dict = [{'instruction':data['query'].split('\n')[0], 'input':get_input(data['query']), 'output':data['response']} for data in list_data_dict]
+        # if 'instruction' in list_data_dict[0]:
+        #     pass
+        # else:
+        #     def get_input(query):
+        #         if query.find('\n') == -1:
+        #             return ''
+        #         return '\n'.join(query.split('\n')[1:])
+        #     # query的第一行作为指令，第二行开始作为input
+        #     list_data_dict = [{'instruction':data['query'].split('\n')[0], 'input':get_input(data['query']), 'output':data['response']} for data in list_data_dict]
+
+        list_data_dict = [{
+            'input': data['question'],
+            'output': data['process']
+        } for data in list_data_dict]
         # import ipdb; ipdb.set_trace()
+        # sources = [
+        #     prompt_input.format_map(example) if example.get("input", "") != "" else prompt_no_input.format_map(example)
+        #     for example in list_data_dict
+        # ]
         sources = [
-            prompt_input.format_map(example) if example.get("input", "") != "" else prompt_no_input.format_map(example)
+            prompt_input.format_map(example)
             for example in list_data_dict
         ]
         targets = [f"{example['output']}{tokenizer.eos_token}" for example in list_data_dict]
@@ -239,7 +257,7 @@ class DataCollatorForSupervisedDataset(object):
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
 
-def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
+def make_supervised_data_module(tokenizer: Union[transformers.PreTrainedTokenizer, transformers.PreTrainedTokenizerFast], data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
     train_dataset = SupervisedDataset(tokenizer=tokenizer, data_args=data_args)
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
@@ -247,22 +265,23 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, dat
 
 
 def train():
-    parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
+    parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments)) 
     model_args, data_args, training_args, remaining_args = parser.parse_args_into_dataclasses(return_remaining_strings=True)
     data_args.data_length = int(remaining_args[1])
 
     model = transformers.AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
-        cache_dir=training_args.cache_dir,
+        # cache_dir=training_args.cache_dir,
     )
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
-        cache_dir=training_args.cache_dir,
+        # cache_dir=training_args.cache_dir,
         model_max_length=training_args.model_max_length,
         padding_side="right",
         use_fast=False,
     )
+    # 如果分词器中不包含填充token,使用预定义的,并且使用smart_tokenizer_and_embedding_resize动态调整模型和分词器的嵌入层
     if tokenizer.pad_token is None:
         smart_tokenizer_and_embedding_resize(
             special_tokens_dict=dict(pad_token=DEFAULT_PAD_TOKEN),
@@ -273,7 +292,7 @@ def train():
         tokenizer.add_special_tokens(
             {
                 "eos_token": DEFAULT_EOS_TOKEN,
-                "bos_token": DEFAULT_BOS_TOKEN,
+                "bos_token": DEFAULT_BOS_TOKEN, 
                 "unk_token": DEFAULT_UNK_TOKEN,
             }
         )
@@ -283,7 +302,7 @@ def train():
     trainer.train()
     trainer.save_state()
     # if os.environ.get('LOCAL_RANK') == '0':
-    safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+    # safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
 
 
 if __name__ == "__main__":
